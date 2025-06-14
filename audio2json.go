@@ -237,7 +237,10 @@ func transcribeFileInChunks(file string, duration float64, lang string, debug bo
 	anySuccess := false
 	for i, err := range chunkErrors {
 		if err != nil {
-			log.Printf("Warning: chunk %d error: %v\n", i, err)
+			// Log warnings only if debug mode is enabled
+			if debug {
+				log.Printf("Warning: chunk %d error: %v\n", i, err)
+			}
 		} else {
 			anySuccess = true
 		}
