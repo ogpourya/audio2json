@@ -58,7 +58,7 @@ cat filelist.txt | audio2json [options]
 ### Example:
 
 ```bash
-audio2json audios/sample1.mp3 audios/sample2.ogg
+audio2json -lang en-US -debug audio1.mp3 audio2.ogg
 ```
 
 ### Supported languages
