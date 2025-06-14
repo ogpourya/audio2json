@@ -4,7 +4,7 @@ set -e
 
 echo "Starting tests..."
 
-BIN="go run main.go"
+BIN="go run audio2json.go"
 
 # Test 1: No files given => should show help
 echo "Test 1: No files"

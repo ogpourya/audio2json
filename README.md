@@ -6,9 +6,6 @@
 > No API key is required to use this tool. It uses a free Google Speech-to-Text API endpoint provided by [pyTranscriber](https://github.com/raryelcostasouza/pyTranscriber/).  
 > Accuracy depends entirely on the Google Speech-to-Text API 🤷‍♂️.
 
-> **Known Limitation:**  
-> The audio file length should not exceed 30 seconds (this is the maximum limit, ideally shorter). However, there is no rate limit restriction in the API, so you can write a script to transcribe much longer files. This feature might be added natively in a future update.
-
 ## Features
 
 - Transcribes audio files to text (JSON output)  
@@ -16,6 +13,7 @@
 - Configurable language code (default `en-US`)  
 - Silent mode by default, with optional debug mode for detailed logs  
 - Uses `ffmpeg` to handle audio conversion to required format  
+- Supports long audio files by splitting them into 15-second chunks for transcription
 - Concurrent transcription with safe limits to avoid API rate issues  
 
 ## Installation
