@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pzaeemfar/audio2json/config"
+	"github.com/ogpourya/audio2json/config"
 )
 
 func Transcribe(audioPath, lang string) (*string, error) {

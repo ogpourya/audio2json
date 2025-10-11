@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pzaeemfar/audio2json/transcribe"
+	"github.com/ogpourya/audio2json/transcribe"
 )
 
 const chunkDuration = 15.0 // seconds per chunk

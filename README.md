@@ -27,7 +27,7 @@ sudo apt install ffmpeg
 ```
 Then install the tool using Go:
 ```bash
-GOPROXY=direct go install github.com/pzaeemfar/audio2json@latest
+GOPROXY=direct go install github.com/ogpourya/audio2json@latest
 ```
 
 ## Usage

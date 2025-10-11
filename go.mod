@@ -1,3 +1,3 @@
-module github.com/pzaeemfar/audio2json
+module github.com/ogpourya/audio2json
 
 go 1.24.2
