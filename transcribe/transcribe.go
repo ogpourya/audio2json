@@ -3,7 +3,6 @@ package transcribe
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -45,7 +44,8 @@ func Transcribe(audioPath, lang string) (*string, error) {
 	}
 	req.Header.Set("Content-Type", "audio/l16; rate=16000; channels=1")
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	// CHANGED: Increased timeout to 60s for stability
+	client := &http.Client{Timeout: 60 * time.Second}
 
 	var resp *http.Response
 	for i := 0; i < 3; i++ {
@@ -124,11 +124,15 @@ func extractTranscript(response string) (*string, error) {
 		}
 	}
 
-	return nil, errors.New("no transcription found in response")
+	// CHANGED: If no text found, return empty string instead of error.
+	// This prevents retries on silent chunks (like intro music).
+	empty := ""
+	return &empty, nil
 }
 
 func convertToWav(inputPath, outputPath string) error {
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, "-ar", "16000", "-ac", "1", outputPath)
+	// Suppress ffmpeg output to keep logs clean
+	cmd := exec.Command("ffmpeg", "-v", "error", "-y", "-i", inputPath, "-ar", "16000", "-ac", "1", outputPath)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr

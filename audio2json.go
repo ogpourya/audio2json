@@ -9,13 +9,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ogpourya/audio2json/transcribe"
 )
 
-const chunkDuration = 15.0 // seconds per chunk
+const chunkDuration = 15.0 
+const maxConcurrentUploads = 10 
+const maxRetries = 10 
 
 func main() {
 	checkFFmpegAndProbe()
@@ -51,72 +55,166 @@ func main() {
 	}
 
 	fileResultsChan := make(chan fileResult, len(files))
-
 	var wg sync.WaitGroup
-	maxFileWorkers := 3
-	fileJobs := make(chan string, len(files))
 
-	worker := func() {
-		defer wg.Done()
-		for file := range fileJobs {
-			if *debug {
-				fmt.Printf("Processing file: %s\n", file)
-			}
-
-			duration, err := getAudioDuration(file)
-			if err != nil {
-				log.Printf("Failed to get duration for %s: %v\n", file, err)
-				fileResultsChan <- fileResult{filename: filepath.Base(file), text: nil, err: err}
-				continue
-			}
-
-			if duration <= chunkDuration {
-				if *debug {
-					fmt.Printf("Transcribing full file (<=15s): %s\n", file)
-				}
-				text, err := transcribeFile(file, *lang, *debug)
-				fileResultsChan <- fileResult{filename: filepath.Base(file), text: text, err: err}
-			} else {
-				if *debug {
-					fmt.Printf("File >15s, transcribing in chunks: %s\n", file)
-				}
-				text, err := transcribeFileInChunks(file, duration, *lang, *debug)
-				fileResultsChan <- fileResult{filename: filepath.Base(file), text: text, err: err}
-			}
-		}
-	}
-
-	wg.Add(maxFileWorkers)
-	for i := 0; i < maxFileWorkers; i++ {
-		go worker()
-	}
+	startTotal := time.Now()
 
 	for _, file := range files {
-		fileJobs <- file
+		wg.Add(1)
+		go func(f string) {
+			defer wg.Done()
+			if *debug {
+				fmt.Printf("🚀 Starting file: %s\n", f)
+			}
+
+			// We ignore the error here so we always get the text
+			text, _ := processFileFast(f, *lang, *debug)
+			
+			fileResultsChan <- fileResult{
+				filename: filepath.Base(f),
+				text:     text,
+				err:      nil, // Force nil error so JSON is always generated
+			}
+		}(file)
 	}
-	close(fileJobs)
 
 	wg.Wait()
 	close(fileResultsChan)
 
+	if *debug {
+		fmt.Printf("✅ Total time taken: %v\n", time.Since(startTotal))
+	}
+
 	results := make(map[string]*string)
 	for res := range fileResultsChan {
-		if res.err != nil {
-			log.Printf("Error transcribing %s: %v\n", res.filename, res.err)
-		}
 		results[res.filename] = res.text
 	}
 
 	printJSON(results)
 }
 
+func processFileFast(file, lang string, debug bool) (*string, error) {
+	tmpDir, err := os.MkdirTemp("", "a2j_chunks_*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to make temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir) 
+
+	chunkPattern := filepath.Join(tmpDir, "chunk_%03d.wav")
+	
+	if debug {
+		fmt.Printf("🔪 Splitting audio %s...\n", file)
+	}
+
+	cmd := exec.Command("ffmpeg", 
+		"-v", "error", 
+		"-i", file, 
+		"-f", "segment", 
+		"-segment_time", fmt.Sprintf("%f", chunkDuration), 
+		"-c:a", "pcm_s16le", 
+		"-ar", "16000", 
+		"-ac", "1", 
+		chunkPattern,
+	)
+
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("ffmpeg splitting failed: %s", string(output))
+	}
+
+	var chunks []string
+	entries, _ := os.ReadDir(tmpDir)
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".wav") {
+			chunks = append(chunks, filepath.Join(tmpDir, e.Name()))
+		}
+	}
+	sort.Strings(chunks)
+
+	if len(chunks) == 0 {
+		return nil, fmt.Errorf("no audio chunks created")
+	}
+
+	type chunkResult struct {
+		index int
+		text  string
+		err   error
+	}
+	
+	resultsChan := make(chan chunkResult, len(chunks))
+	var chunkWg sync.WaitGroup
+
+	sem := make(chan struct{}, maxConcurrentUploads)
+
+	for i, chunkPath := range chunks {
+		chunkWg.Add(1)
+		
+		go func(idx int, path string) {
+			defer chunkWg.Done()
+			sem <- struct{}{} 
+			defer func() { <-sem }()
+
+			var txt *string
+			var err error
+
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				// Only log retries if it's NOT the silence error
+				// This keeps logs clean for expected silence
+				txt, err = transcribe.Transcribe(path, lang)
+				if err == nil {
+					break
+				}
+				
+				// If error is "no transcription", don't retry, just accept it's empty
+				if strings.Contains(err.Error(), "no transcription") {
+					err = nil 
+					empty := ""
+					txt = &empty
+					break
+				}
+
+				if debug && attempt > 1 {
+					fmt.Printf("🔄 Retry %d/%d for chunk %d: %v\n", attempt, maxRetries, idx, err)
+				} 
+				
+				time.Sleep(time.Second * time.Duration(attempt))
+			}
+			
+			res := chunkResult{index: idx, err: err}
+			if txt != nil {
+				res.text = *txt
+			}
+			resultsChan <- res
+		}(i, chunkPath)
+	}
+
+	chunkWg.Wait()
+	close(resultsChan)
+
+	orderedText := make([]string, len(chunks))
+	var errs []string
+
+	for res := range resultsChan {
+		if res.err != nil {
+			errs = append(errs, fmt.Sprintf("chunk %d", res.index))
+			// We just leave this index empty in orderedText
+		} else {
+			orderedText[res.index] = res.text
+		}
+	}
+
+	// CHANGED: We do NOT return error here anymore. 
+	// We just log warnings and return whatever text we managed to get.
+	if len(errs) > 0 && debug {
+		log.Printf("⚠️ Warning: Failed to transcribe chunks: %v (skipping them)", errs)
+	}
+
+	fullText := strings.TrimSpace(strings.Join(orderedText, " "))
+	return &fullText, nil
+}
+
 func checkFFmpegAndProbe() {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		fmt.Fprintln(os.Stderr, "Error: ffmpeg not found. Install and add to PATH.")
-		os.Exit(1)
-	}
-	if _, err := exec.LookPath("ffprobe"); err != nil {
-		fmt.Fprintln(os.Stderr, "Error: ffprobe not found. Install and add to PATH.")
 		os.Exit(1)
 	}
 }
@@ -133,9 +231,6 @@ func getFilesFromArgsOrStdin() []string {
 				files = append(files, line)
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			log.Fatalf("Error reading stdin: %v", err)
-		}
 	} else {
 		if flag.NArg() == 0 {
 			return nil
@@ -143,139 +238,6 @@ func getFilesFromArgsOrStdin() []string {
 		files = flag.Args()
 	}
 	return files
-}
-
-func getAudioDuration(file string) (float64, error) {
-	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries",
-		"format=duration", "-of", "default=noprint_wrappers=1:nokey=1", file)
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, err
-	}
-	var duration float64
-	_, err = fmt.Sscanf(string(output), "%f", &duration)
-	return duration, err
-}
-
-func transcribeFile(file, lang string, debug bool) (*string, error) {
-	if debug {
-		fmt.Printf("Transcribing file: %s\n", file)
-	}
-	text, err := transcribe.Transcribe(file, lang)
-	if err != nil {
-		return nil, err
-	}
-	if text == nil {
-		if debug {
-			fmt.Printf("Warning: transcription returned nil text for %s\n", file)
-		}
-		return nil, fmt.Errorf("transcription returned nil text for %s", file)
-	}
-	return text, nil
-}
-
-func transcribeFileInChunks(file string, duration float64, lang string, debug bool) (*string, error) {
-	chunksCount := int(duration / chunkDuration)
-	if duration > float64(chunksCount)*chunkDuration {
-		chunksCount++
-	}
-
-	chunkTexts := make([]*string, chunksCount)
-	chunkErrors := make([]error, chunksCount)
-
-	var chunkWg sync.WaitGroup
-	chunkJobs := make(chan int, chunksCount)
-
-	chunkWorker := func() {
-		defer chunkWg.Done()
-		for i := range chunkJobs {
-			start := float64(i) * chunkDuration
-			length := chunkDuration
-			if start+length > duration {
-				length = duration - start
-			}
-
-			chunkFile := fmt.Sprintf("%s_chunk_%d.wav", file, i)
-			if debug {
-				fmt.Printf("Extracting chunk %d: %s (start=%.2fs length=%.2fs)\n", i, chunkFile, start, length)
-			}
-
-			err := extractChunk(file, start, length, chunkFile)
-			if err != nil {
-				chunkErrors[i] = fmt.Errorf("chunk extraction error: %v", err)
-				continue
-			}
-
-			text, err := transcribe.Transcribe(chunkFile, lang)
-			os.Remove(chunkFile)
-			if err != nil {
-				chunkErrors[i] = fmt.Errorf("chunk transcription error: %v", err)
-				continue
-			}
-			if text == nil {
-				chunkErrors[i] = fmt.Errorf("chunk transcription returned nil text")
-				continue
-			}
-			chunkTexts[i] = text
-		}
-	}
-
-	workerCount := 3
-	chunkWg.Add(workerCount)
-	for i := 0; i < workerCount; i++ {
-		go chunkWorker()
-	}
-
-	for i := 0; i < chunksCount; i++ {
-		chunkJobs <- i
-	}
-	close(chunkJobs)
-
-	chunkWg.Wait()
-
-	// Allow partial success — log errors but keep successful chunk texts
-	anySuccess := false
-	for i, err := range chunkErrors {
-		if err != nil {
-			// Log warnings only if debug mode is enabled
-			if debug {
-				log.Printf("Warning: chunk %d error: %v\n", i, err)
-			}
-		} else {
-			anySuccess = true
-		}
-	}
-
-	if !anySuccess {
-		return nil, fmt.Errorf("all chunks failed to transcribe")
-	}
-
-	var combined strings.Builder
-	for _, t := range chunkTexts {
-		if t != nil {
-			combined.WriteString(*t + " ")
-		}
-	}
-	finalText := strings.TrimSpace(combined.String())
-	return &finalText, nil
-}
-
-func extractChunk(input string, start float64, duration float64, chunkFile string) error {
-	args := []string{
-		"-ss", fmt.Sprintf("%.2f", start),
-		"-t", fmt.Sprintf("%.2f", duration),
-		"-i", input,
-		"-acodec", "pcm_s16le",
-		"-ar", "16000",
-		"-ac", "1",
-		chunkFile,
-		"-y",
-	}
-	cmd := exec.Command("ffmpeg", args...)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("ffmpeg failed: %w", err)
-	}
-	return nil
 }
 
 func uniqueFiles(files []string) []string {
@@ -299,19 +261,16 @@ func printJSON(data map[string]*string) {
 }
 
 func printHelp() {
-	fmt.Println(`audio2json - Transcribe audio files to text (JSON output)
+	fmt.Println(`audio2json - Fast Transcription
 
 Usage:
   audio2json [options] file1 file2 ...
 
 Options:
   -lang string
-        Language code for transcription (default "en-US")
+        Language code (default "en-US")
   -debug
-        Debug mode - show progress and errors
+        Show detailed progress
   -help
-        Show this help message
-
-Example:
-  audio2json -lang en-US -debug audio1.mp3 audio2.ogg`)
+        Show help`)
 }
